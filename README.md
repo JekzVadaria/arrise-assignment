@@ -7,6 +7,7 @@
 | 2.2 Concurrent `apply` explanation | Answer | [Task 2](#task-2--remote-state--locking) |
 | 3. Multi-account IAM | Design + answers | [Task 3](#task-3--multi-account-iam--cross-account-access) |
 | 4. Least-privilege policy | Policy JSON + answer | [Task 4](#task-4--least-privilege-policy-for-ci) |
+| 5. Find and fix the bug | Fixed code + answer | [Task 5](#task-5--find-and-fix-the-bug) |
 
 Account A = `000000000000`, Account B = `111111111111`, Region `eu-west-1`. Resource names and IDs in `terraform.tfvars` are placeholders.
 
@@ -279,6 +280,67 @@ Example targets: ECR repo `arrise/game-api`, ECS service `game-api` in cluster `
 | `s3:PutObject`, `DeleteObject`, bucket configuration, `ListAllMyBuckets` | The requirement is read-only access to one known bucket. |
 | `kms:Decrypt` | Only needed if the bucket uses SSE-KMS with a customer key. If so, scope it to that key with `kms:ViaService`. |
 | CloudWatch Logs, wildcards like `ecs:*` | Not part of the job. Container logs are written by the task execution role, not CI. |
+
+---
+
+## Task 5 — Find and Fix the Bug
+
+**Fixed snippet**
+
+```hcl
+data "aws_iam_policy_document" "roleC_trust" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::000000000000:role/roleB"]   # was: user/roleB
+    }
+  }
+}
+
+resource "aws_iam_role" "roleC" {
+  name               = "roleC"
+  assume_role_policy = data.aws_iam_policy_document.roleC_trust.json
+}
+
+resource "aws_iam_role_policy" "roleC_s3" {
+  name = "roleC-s3-access"
+  role = aws_iam_role.roleC.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = "s3:*"
+      Resource = [                                              # was: "*"
+        "arn:aws:s3:::arrise-shared-data",
+        "arn:aws:s3:::arrise-shared-data/*",
+      ]
+    }]
+  })
+}
+```
+
+### Issue 1: trust policy, wrong principal type (`user/` instead of `role/`)
+
+The ARN type is part of the identity. `arn:aws:iam::000000000000:user/roleB` means *an IAM **user** named roleB*, but roleB is a **role**.
+
+- When a trust policy is saved, IAM resolves every principal to its unique ID. No user named roleB exists, so IAM rejects the policy with **`MalformedPolicyDocument: Invalid principal in policy`**, and `terraform apply` fails while creating `aws_iam_role.roleC`.
+- Even if a user called roleB existed, the policy would trust that user. The real roleB, which calls as `arn:aws:sts::000000000000:assumed-role/roleB/<session>`, still would not match, so `sts:AssumeRole` would return **AccessDenied**.
+
+### Issue 2: permissions policy, `Resource = "*"` on `s3:*`
+
+This does not cause an error. It is a **security** bug: roleC gets full control (read, overwrite, delete, change policies) of **every** S3 bucket in Account B, plus any bucket elsewhere whose bucket policy trusts Account B. The requirement is one named bucket.
+
+The fix needs **two ARNs**, because S3 has two resource levels:
+
+- `arn:aws:s3:::<bucket>` covers bucket-level actions such as `ListBucket` and `GetBucketPolicy`;
+- `arn:aws:s3:::<bucket>/*` covers object-level actions such as `GetObject`, `PutObject` and `DeleteObject`.
+
+Listing only `<bucket>/*` is a common mistake. Object reads then work but listing the bucket fails.
+
+Also note that the snippet covers only Account B's side. roleB in Account A still needs its own `sts:AssumeRole` permission on roleC (see [Task 3](#task-3--multi-account-iam--cross-account-access)).
 
 ---
 
