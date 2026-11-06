@@ -6,6 +6,7 @@
 | 2.1 Remote state and locking | Terraform | [`bootstrap/state-backend`](bootstrap/state-backend), [`stacks/ec2-fleet/backend.tf`](stacks/ec2-fleet/backend.tf) |
 | 2.2 Concurrent `apply` explanation | Answer | [Task 2](#task-2--remote-state--locking) |
 | 3. Multi-account IAM | Design + answers | [Task 3](#task-3--multi-account-iam--cross-account-access) |
+| 4. Least-privilege policy | Policy JSON + answer | [Task 4](#task-4--least-privilege-policy-for-ci) |
 
 Account A = `000000000000`, Account B = `111111111111`, Region `eu-west-1`. Resource names and IDs in `terraform.tfvars` are placeholders.
 
@@ -185,6 +186,102 @@ If the account root must be trusted, add `"Condition": {"ArnEquals": {"aws:Princ
 
 ---
 
+## Task 4 — Least-Privilege Policy for `ci`
+
+Example targets: ECR repo `arrise/game-api`, ECS service `game-api` in cluster `arrise-dev`, artifact bucket `arrise-build-artifacts`.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EcrLogin",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcrPushToOneRepository",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchGetImage",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage"
+      ],
+      "Resource": "arn:aws:ecr:eu-west-1:000000000000:repository/arrise/game-api"
+    },
+    {
+      "Sid": "RegisterTaskDefinitionForOneFamily",
+      "Effect": "Allow",
+      "Action": "ecs:RegisterTaskDefinition",
+      "Resource": "arn:aws:ecs:eu-west-1:000000000000:task-definition/game-api:*"
+    },
+    {
+      "Sid": "ReadCurrentTaskDefinition",
+      "Effect": "Allow",
+      "Action": "ecs:DescribeTaskDefinition",
+      "Resource": "*"
+    },
+    {
+      "Sid": "DeployToOneService",
+      "Effect": "Allow",
+      "Action": ["ecs:UpdateService", "ecs:DescribeServices"],
+      "Resource": "arn:aws:ecs:eu-west-1:000000000000:service/arrise-dev/game-api"
+    },
+    {
+      "Sid": "PassOnlyThisServicesTaskRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::000000000000:role/game-api-task-execution",
+        "arn:aws:iam::000000000000:role/game-api-task"
+      ],
+      "Condition": { "StringEquals": { "iam:PassedToService": "ecs-tasks.amazonaws.com" } }
+    },
+    {
+      "Sid": "ListArtifactBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::arrise-build-artifacts"
+    },
+    {
+      "Sid": "ReadArtifacts",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::arrise-build-artifacts/*"
+    }
+  ]
+}
+```
+
+**Why each part is needed**
+
+- **`ecr:GetAuthorizationToken`** is needed for `docker login`. It does not support resource-level permissions, so `"*"` is required.
+- **The six ECR actions** are exactly what `docker push` calls, scoped to one repository. Five upload the layers and the manifest. `BatchGetImage` is needed because, before writing the tag, Docker first sends a `HEAD` request for the manifest, which ECR authorizes as `BatchGetImage`. Without it the push fails with `403 Forbidden` after the layers have already uploaded. This was confirmed in a live test (see [Verification](#verification)).
+- **A new ECS deployment** is `RegisterTaskDefinition` (scoped to the `game-api` family) → `UpdateService` → `DescribeServices`. `DescribeServices` is what `aws ecs wait services-stable` polls. `DescribeTaskDefinition` reads the current revision to build the next one. It is read-only and cannot be resource-scoped.
+- **`iam:PassRole`** is required because the task definition references an execution role and a task role. It is limited to those two roles, and only when passed to ECS tasks.
+- **`s3:ListBucket`** goes on the bucket ARN and **`s3:GetObject`** on the objects ARN. List is also what makes a missing object return 404 instead of 403.
+
+### What was deliberately left out, and why
+
+| Left out | Reason |
+|---|---|
+| `iam:PassRole` on `*` | **The critical omission.** CI could register a task definition that runs as an admin role and deploy it, turning a deploy credential into full account access. |
+| ECR layer download (`GetDownloadUrlForLayer`) | Not needed to push. Together with `BatchGetImage` it would let CI pull images. Add it only if the build uses the repo as a layer cache. |
+| ECR admin (`CreateRepository`, `DeleteRepository`, `BatchDeleteImage`, `SetRepositoryPolicy`, lifecycle/tag-mutability) | Repositories are owned by IaC. `BatchDeleteImage` could delete rollback images. |
+| `ecs:CreateService`, `DeleteService`, `RunTask`, `StartTask`, `StopTask` | Deploying updates an **existing** service. `RunTask` would let CI run arbitrary tasks with the passed roles. |
+| `ecs:DeregisterTaskDefinition` | Old revisions are rollback targets. |
+| `ecs:ExecuteCommand` | A pipeline must never get a shell inside running containers. |
+| `ecs:TagResource` | Only needed if task definitions are registered with tags. |
+| `s3:PutObject`, `DeleteObject`, bucket configuration, `ListAllMyBuckets` | The requirement is read-only access to one known bucket. |
+| `kms:Decrypt` | Only needed if the bucket uses SSE-KMS with a customer key. If so, scope it to that key with `kms:ViaService`. |
+| CloudWatch Logs, wildcards like `ecs:*` | Not part of the job. Container logs are written by the task execution role, not CI. |
+
+---
+
 ## Verification
 
 These checks ran locally with Terraform 1.14.5 and AWS provider 6.72.0, without AWS credentials. CI runs the same checks, and `make ci` runs them locally.
@@ -196,3 +293,14 @@ These checks ran locally with Terraform 1.14.5 and AWS provider 6.72.0, without 
 | Checkov | 0 failed. Every skip is inline next to its resource, with a reason. |
 | `terraform test` (mocked provider) | 15 passing. The module has 10: protected/unprotected split, tags, IMDSv2/encryption/no public IP, volume settings, key pairs, outputs, and invalid input (including a fleet with no io1/io2 volume). The stack has 5: the committed 2-web/2-app/1-db tfvars meet every Task 1 rule, and each stack rule rejects a violating change. |
 
+### Task 4 policy: tested in a real AWS account
+
+The policy was checked in three ways against a real account, using throwaway resources: an ECR repo, an ECS cluster and service, an artifact bucket, and the two task roles.
+
+| Check | Result |
+|---|---|
+| IAM Access Analyzer `validate-policy` | No errors, security warnings or suggestions |
+| IAM policy simulator | 27/27 expected allow/deny decisions |
+| Live run as an identity holding **only** this policy | **19/19**. Real `docker push`; describe → register → `update-service` → `wait services-stable`; S3 list and download all succeeded. Ten forbidden actions were denied: push to another repo, delete images or repo, register another family, pass an unapproved role, update another service, `CreateService`, `RunTask`, S3 write/delete. |
+
+The live run found one gap the simulator could not. With only the five upload actions, `docker push` uploaded every layer and then failed with `403 Forbidden` on `HEAD /v2/<repo>/manifests/<tag>`. CloudTrail recorded it as `BatchGetImage AccessDenied`. `ecr:BatchGetImage` was added to the push statement, and the full run then passed.
