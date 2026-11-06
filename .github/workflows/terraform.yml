@@ -1,0 +1,87 @@
+name: terraform
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege for the workflow token. Jobs that need more ask for it.
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.14.5
+      - run: terraform fmt -recursive -check -diff
+
+  validate-and-test:
+    name: validate + test (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir:
+          - modules/ec2-fleet
+          - stacks/ec2-fleet
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.14.5
+          terraform_wrapper: false
+      - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
+      - uses: actions/cache@v6
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+      - name: init (no backend)
+        run: terraform -chdir=${{ matrix.dir }} init -backend=false
+      - name: validate
+        run: terraform -chdir=${{ matrix.dir }} validate
+      - name: test
+        if: hashFiles(format('{0}/tests/*.tftest.hcl', matrix.dir)) != ''
+        run: terraform -chdir=${{ matrix.dir }} test
+
+  tflint:
+    name: tflint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: v0.61.0
+      - run: tflint --init --config="$GITHUB_WORKSPACE/.tflint.hcl"
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids GitHub API rate limits when downloading plugins
+      - name: lint every directory
+        run: |
+          for d in modules/* stacks/*; do
+            echo "==> $d"
+            tflint --chdir="$d" --config="$GITHUB_WORKSPACE/.tflint.hcl" --format=compact
+          done
+
+  checkov:
+    name: checkov
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          config_file: .checkov.yaml

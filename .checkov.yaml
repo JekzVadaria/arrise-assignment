@@ -1,0 +1,11 @@
+# Checkov configuration. Resource-specific exceptions are made inline with
+# `#checkov:skip=<ID>:<reason>` so every exception sits next to the code it
+# applies to and carries a reason.
+framework:
+  - terraform
+  - github_actions
+compact: true
+quiet: true
+download-external-modules: false
+skip-path:
+  - .terraform

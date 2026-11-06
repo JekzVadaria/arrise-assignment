@@ -1,0 +1,36 @@
+# Terraform working directories and local state
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Lock files are committed for ROOT modules only (stacks/, bootstrap/).
+# Reusable child modules must not pin their callers.
+modules/**/.terraform.lock.hcl
+
+# Never commit secret variable files. The committed terraform.tfvars files
+# hold example, non-secret values only.
+*.secret.tfvars
+*.auto.tfvars
+secrets/
+
+# Keys and credentials
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,25 @@
+# terraform-docs injects generated input/output tables into each README
+# between the BEGIN_TF_DOCS / END_TF_DOCS markers. Run `make docs`.
+formatter: markdown table
+
+output:
+  file: README.md
+  mode: inject
+
+sort:
+  enabled: true
+  by: required
+
+settings:
+  anchor: false
+  default: true
+  escape: true
+  hide-empty: true
+  html: false
+  indent: 3
+  # Show version constraints, not the locally installed provider version, so
+  # the output is identical on every machine (modules have no lock file).
+  lockfile: false
+  required: true
+  sensitive: true
+  type: true
