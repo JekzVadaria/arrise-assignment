@@ -5,6 +5,7 @@
 | 1. Multi-instance EC2 | Terraform | [`modules/ec2-fleet`](modules/ec2-fleet), [`stacks/ec2-fleet`](stacks/ec2-fleet), answer in [Task 1](#task-1--multi-instance-ec2-provisioning) |
 | 2.1 Remote state and locking | Terraform | [`bootstrap/state-backend`](bootstrap/state-backend), [`stacks/ec2-fleet/backend.tf`](stacks/ec2-fleet/backend.tf) |
 | 2.2 Concurrent `apply` explanation | Answer | [Task 2](#task-2--remote-state--locking) |
+| 3. Multi-account IAM | Design + answers | [Task 3](#task-3--multi-account-iam--cross-account-access) |
 
 Account A = `000000000000`, Account B = `111111111111`, Region `eu-west-1`. Resource names and IDs in `terraform.tfvars` are placeholders.
 
@@ -95,6 +96,92 @@ With local state, each person's `terraform.tfstate` lives on their own machine, 
 4. **Recovery:** S3 versioning keeps every previous state, so a bad write can be rolled back.
 
 Terraform ≥ 1.10 can lock natively in S3 (`use_lockfile = true`), and ≥ 1.11 marks `dynamodb_table` as deprecated. DynamoDB is used here because the task requires it. To migrate, enable both, then remove `dynamodb_table`.
+
+---
+
+## Task 3 — Multi-Account IAM & Cross-Account Access
+
+### Design
+
+**Account A (`000000000000`)**
+
+| Item | Configuration |
+|---|---|
+| `group1`: `engine`, `ci` | Programmatic access only: access keys, **no login profile**, so they cannot sign in to the console. `ci` gets the Task 4 policy. `engine` gets `sts:AssumeRole` on roleB. |
+| `group2`: `alice`, `bob` | Console + CLI: login profile (password reset at first sign-in) plus access keys. The group policy lets members manage only their own password, MFA and keys, **denies everything else until MFA is used**, and allows assuming roleA with MFA. |
+| `roleA` | Admin on everything except IAM. Trusted by alice and bob, **with MFA required**. |
+| `roleB` | Its only permission is to assume roleC in Account B. Trusted by `engine` only. |
+
+IAM groups **cannot be principals** in a trust policy. roleA and roleB therefore list the user ARNs, and the group policy grants the matching `sts:AssumeRole`.
+
+**roleA permission policy:** everything except IAM.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "AllServicesExceptIAM", "Effect": "Allow", "NotAction": "iam:*", "Resource": "*" },
+    { "Sid": "ServiceLinkedRoles", "Effect": "Allow", "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "arn:aws:iam::000000000000:role/aws-service-role/*" },
+    { "Sid": "PassPreApprovedRolesOnly", "Effect": "Allow", "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::000000000000:role/workload/*" }
+  ]
+}
+```
+
+`Allow` + `NotAction: iam:*` grants every action outside the IAM namespace. Without the two narrow IAM exceptions, an "admin" could not launch an EC2 instance with an instance profile or an ECS task with a role.
+
+PassRole is limited to `/workload/` roles that only IAM admins can create, because roleA cannot create or edit roles. That means PassRole cannot be used to escalate. Adding the same policy as a **permissions boundary** keeps the limit in place even if someone later attaches `AdministratorAccess`.
+
+**roleB:** trust policy and permission policy.
+
+```json
+{ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Action": "sts:AssumeRole",
+  "Principal": { "AWS": "arn:aws:iam::000000000000:user/engine" } }] }
+```
+
+```json
+{ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Action": "sts:AssumeRole",
+  "Resource": "arn:aws:iam::111111111111:role/roleC" }] }
+```
+
+**Account B (`111111111111`): roleC trust policy and permission policy.**
+
+```json
+{ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Action": "sts:AssumeRole",
+  "Principal": { "AWS": "arn:aws:iam::000000000000:role/roleB" } }] }
+```
+
+```json
+{ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Action": "s3:*",
+  "Resource": [ "arn:aws:s3:::arrise-shared-data", "arn:aws:s3:::arrise-shared-data/*" ] }] }
+```
+
+Cross-account access needs **both sides** to agree: roleB's identity policy allows the call, and roleC's trust policy allows the caller. The resulting path is `engine → roleB → roleC → one bucket`.
+
+### Q1. Would you give `engine` and `ci` IAM users with access keys in a real production setup?
+
+**No.** Access keys are long-lived credentials that never expire on their own. They get copied into CI secret stores, environment variables, laptops and logs, and a leaked key works from anywhere until someone notices. Production machine identities should use **roles with short-lived, automatically rotated credentials**:
+
+- **`ci` → OIDC federation.** Register the CI provider (e.g. `token.actions.githubusercontent.com`) as an IAM OIDC identity provider and create a CI role. The role's trust policy checks `aud = sts.amazonaws.com` and `sub = repo:<org>/<repo>:ref:refs/heads/main`. Each job receives roughly one-hour credentials, and **no secret is stored anywhere**. The Task 4 policy attaches to this role unchanged. This repo's CI `plan` job works this way. If CI runs on AWS (CodeBuild, or runners on EC2/EKS), use its service role or instance role.
+- **`engine` → a workload role.** On AWS, use an EC2 instance profile, ECS task role, EKS Pod Identity/IRSA or Lambda execution role, where AWS issues and rotates the credentials. Off AWS, use **IAM Roles Anywhere**, which exchanges an X.509 certificate for temporary credentials. roleB's trust policy then names engine's role instead of a user.
+- **People (group2) → IAM Identity Center** with the corporate IdP, MFA and permission sets, instead of IAM users.
+
+If keys are truly unavoidable, use one key per user, automate rotation (≤ 90 days), store it in Secrets Manager, restrict where it works with `aws:SourceIp`/`aws:SourceVpce`, and alert on unusual use.
+
+### Q2. In roleC's trust policy, why does it matter whether you trust the whole Account A root or roleB's specific ARN?
+
+`arn:aws:iam::000000000000:root` does **not** mean the root user. It means **the whole of Account A**. It delegates the decision to Account A: **any** principal there whose own identity policy allows `sts:AssumeRole` on roleC can assume it. Account B loses control over who gets in.
+
+In this exact design, **roleA would be able to assume roleC**. roleA allows everything except IAM, and that includes `sts:AssumeRole` on `*`. alice and bob could then bypass roleB entirely and get full access to Account B's bucket. The same applies to any future admin role or compromised CI identity in Account A.
+
+Trusting `arn:aws:iam::000000000000:role/roleB` means:
+
+- **Only roleB sessions qualify**, whatever permissions other principals in Account A have.
+- **Account B keeps control** and can audit its exposure by reading one trust policy.
+- **Re-creation is not trusted:** IAM stores roleB's unique ID. If someone deletes roleB and creates a new role with the same name, roleC does not trust it until the trust policy is saved again. That blocks impersonation.
+
+If the account root must be trusted, add `"Condition": {"ArnEquals": {"aws:PrincipalArn": "arn:aws:iam::000000000000:role/roleB"}}`.
 
 ---
 

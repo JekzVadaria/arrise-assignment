@@ -90,7 +90,8 @@ jobs:
   # Real plans run only when an OIDC role is configured for the repository
   # (Settings > Variables: AWS_PLAN_ROLE_ARN). No long-lived AWS keys are
   # stored in GitHub; the job exchanges its OIDC token for a short-lived,
-  # read-only role session.
+  # read-only role session. This is the approach recommended for "ci" in
+  # README.md (Task 3, Q1).
   plan:
     name: plan (${{ matrix.stack }})
     if: github.event_name == 'pull_request' && vars.AWS_PLAN_ROLE_ARN != ''
