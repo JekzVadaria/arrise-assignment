@@ -37,6 +37,7 @@ jobs:
       fail-fast: false
       matrix:
         dir:
+          - bootstrap/state-backend
           - modules/ec2-fleet
           - stacks/ec2-fleet
     steps:
@@ -71,7 +72,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }} # avoids GitHub API rate limits when downloading plugins
       - name: lint every directory
         run: |
-          for d in modules/* stacks/*; do
+          for d in bootstrap/state-backend modules/* stacks/*; do
             echo "==> $d"
             tflint --chdir="$d" --config="$GITHUB_WORKSPACE/.tflint.hcl" --format=compact
           done
@@ -85,3 +86,35 @@ jobs:
         with:
           directory: .
           config_file: .checkov.yaml
+
+  # Real plans run only when an OIDC role is configured for the repository
+  # (Settings > Variables: AWS_PLAN_ROLE_ARN). No long-lived AWS keys are
+  # stored in GitHub; the job exchanges its OIDC token for a short-lived,
+  # read-only role session.
+  plan:
+    name: plan (${{ matrix.stack }})
+    if: github.event_name == 'pull_request' && vars.AWS_PLAN_ROLE_ARN != ''
+    needs: [fmt, validate-and-test, tflint, checkov]
+    runs-on: ubuntu-latest
+    environment: plan
+    permissions:
+      contents: read
+      id-token: write # required to request the OIDC token
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: [stacks/ec2-fleet]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.14.5
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: eu-west-1
+          role-session-name: gha-plan-${{ github.run_id }}
+      - run: terraform -chdir=${{ matrix.stack }} init
+      # -lock-timeout makes a concurrent run wait for the DynamoDB lock
+      # instead of failing straight away.
+      - run: terraform -chdir=${{ matrix.stack }} plan -lock-timeout=5m -out=tfplan

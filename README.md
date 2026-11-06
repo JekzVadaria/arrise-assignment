@@ -3,6 +3,8 @@
 | Task | Deliverable | Where |
 |---|---|---|
 | 1. Multi-instance EC2 | Terraform | [`modules/ec2-fleet`](modules/ec2-fleet), [`stacks/ec2-fleet`](stacks/ec2-fleet), answer in [Task 1](#task-1--multi-instance-ec2-provisioning) |
+| 2.1 Remote state and locking | Terraform | [`bootstrap/state-backend`](bootstrap/state-backend), [`stacks/ec2-fleet/backend.tf`](stacks/ec2-fleet/backend.tf) |
+| 2.2 Concurrent `apply` explanation | Answer | [Task 2](#task-2--remote-state--locking) |
 
 Account A = `000000000000`, Account B = `111111111111`, Region `eu-west-1`. Resource names and IDs in `terraform.tfvars` are placeholders.
 
@@ -14,14 +16,16 @@ Account A = `000000000000`, Account B = `111111111111`, Region `eu-west-1`. Reso
 .
 ├── README.md                        this file: all answers
 ├── Makefile                         make ci = fmt + validate + tflint + checkov + test
-├── .github/workflows/terraform.yml  CI: the same checks
+├── .github/workflows/terraform.yml  CI: the same checks, plus an OIDC-based plan on PRs
 ├── .pre-commit-config.yaml  .tflint.hcl  .checkov.yaml  .terraform-docs.yml
+├── bootstrap/state-backend/         Task 2.1: S3 state bucket, DynamoDB lock table, KMS key
 ├── modules/ec2-fleet/               Task 1: reusable module (+ tests/)
-└── stacks/ec2-fleet/                Task 1 root module: 5 instances (+ tests/)
+└── stacks/ec2-fleet/                Task 1 root module: 5 instances + S3 backend (+ tests/)
 ```
 
 ```bash
 make ci                                                      # all checks, no AWS access needed
+terraform -chdir=bootstrap/state-backend init && terraform -chdir=bootstrap/state-backend apply
 terraform -chdir=stacks/ec2-fleet init && terraform -chdir=stacks/ec2-fleet apply
 ```
 
@@ -63,6 +67,34 @@ The risk is not only `terraform destroy`. On `aws_instance`, changing `subnet_id
 **Implementation detail:** `lifecycle` arguments must be literal values, so `prevent_destroy` cannot vary per `for_each` key. The module splits the single map into two filtered maps feeding two blocks: `aws_instance.this` and `aws_instance.protected` (with `prevent_destroy = true`).
 
 `prevent_destroy` only guards against Terraform, and it stops applying if someone deletes the resource block. The protected instance therefore also has **EC2 termination protection** (`disable_api_termination = true`, with `force_destroy = false` so the provider can't turn it off), and its root volume is kept on termination (`delete_on_termination = false`).
+
+---
+
+## Task 2 — Remote State & Locking
+
+### 2.1 Backend (Terraform)
+
+- `bootstrap/state-backend` creates the backend and runs once, with local state, because the bucket must exist before anything can use it:
+  - **S3 bucket:** versioned, SSE-KMS, Block Public Access, TLS only, `prevent_destroy`.
+  - **DynamoDB table:** `LockID` string hash key, point-in-time recovery, deletion protection.
+- `stacks/ec2-fleet/backend.tf` uses them: `backend "s3" { bucket, key, region, dynamodb_table, encrypt = true, kms_key_id }`.
+- The backend lives in the **root** stack, not the module. Terraform only reads backend configuration from the root module.
+
+### 2.2 What happens today if two people run `apply` at the same time?
+
+With local state, each person's `terraform.tfstate` lives on their own machine, and **nothing coordinates them**.
+
+- **Separate laptops:** person B's state has no record of what person A just created. B's apply creates the same five instances a **second time**, which succeeds silently because EC2 Name tags need not be unique. It fails half-way on resources that must be unique, such as key pairs, or reverts A's changes. The result is duplicate infrastructure, double cost, and state files that disagree with AWS and with each other.
+- **A shared state file** (network drive, same CI runner, or committed to Git): both runs start from the same snapshot, change AWS concurrently, then both write the file. **The last write wins**, and the other run's resources still exist in AWS but are no longer tracked (a lost update). Local state locking only works between processes on one machine. Git cannot merge state.
+
+### How the S3 + DynamoDB backend prevents it
+
+1. **Single source of truth:** everyone reads and writes the same state object in S3.
+2. **Mutual exclusion:** before `plan` or `apply`, Terraform performs a **conditional write** of a lock item (`LockID = <bucket>/<key>`) to DynamoDB. The write succeeds only if no lock exists, so it is atomic. The second run fails immediately with `Error acquiring the state lock`, showing who holds the lock and since when. With `-lock-timeout=5m` it waits instead.
+3. **Ordered updates:** the first run writes the new state, then releases the lock. The second run then starts from the **current** state. Terraform also keeps a state checksum in DynamoDB, so a stale read is detected.
+4. **Recovery:** S3 versioning keeps every previous state, so a bad write can be rolled back.
+
+Terraform ≥ 1.10 can lock natively in S3 (`use_lockfile = true`), and ≥ 1.11 marks `dynamodb_table` as deprecated. DynamoDB is used here because the task requires it. To migrate, enable both, then remove `dynamodb_table`.
 
 ---
 

@@ -9,7 +9,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 
-ROOT_DIRS   := stacks/ec2-fleet
+ROOT_DIRS   := bootstrap/state-backend stacks/ec2-fleet
 MODULE_DIRS := modules/ec2-fleet
 TF_DIRS     := $(ROOT_DIRS) $(MODULE_DIRS)
 TEST_DIRS   := $(foreach d,$(TF_DIRS),$(if $(wildcard $(d)/tests/*.tftest.hcl),$(d)))

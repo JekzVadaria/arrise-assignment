@@ -1,6 +1,6 @@
-# Stack: `ec2-fleet` (Task 1)
+# Stack: `ec2-fleet` (Tasks 1 and 2)
 
-Root module that deploys a three-tier fleet (2 web, 2 app, 1 database) with the `modules/ec2-fleet` module.
+Root module that deploys a three-tier fleet (2 web, 2 app, 1 database) with the `modules/ec2-fleet` module. State is kept in S3 and locked with DynamoDB (`backend.tf`).
 
 | Name | Tier | Instance type | Root volume | Size | Key pair | Protected |
 |---|---|---|---|---|---|---|
@@ -22,7 +22,11 @@ Validation rules enforce the assignment's requirements at plan time:
 ## Run
 
 ```bash
-# Replace the placeholder subnet / SG / account IDs in terraform.tfvars, and
+# 1. Once per account: create the state bucket, lock table and KMS key
+terraform -chdir=bootstrap/state-backend init
+terraform -chdir=bootstrap/state-backend apply
+
+# 2. Replace the placeholder subnet / SG / account IDs in terraform.tfvars, and
 #    create the key pairs (or add public_key to each instance).
 terraform -chdir=stacks/ec2-fleet init
 terraform -chdir=stacks/ec2-fleet plan -out=tfplan
